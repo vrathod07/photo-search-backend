@@ -1,1 +1,243 @@
-Added readme
+# AI Photo Search — Backend
+ 
+Backend for a photo album web app that can be searched using natural language
+(e.g. *"show me cats and dogs"*). Photos are labeled automatically with
+**Amazon Rekognition**, indexed in **Amazon OpenSearch Service**, and searched
+through an **Amazon Lex V2** bot that extracts keywords from the query.
+ 
+Cloud Computing and Big Data Systems — Fall 2026, Assignment 3.
+ 
+The frontend lives in a separate repo: `photo-search-frontend`.
+ 
+---
+ 
+## Architecture
+ 
+```
+Upload:  Browser ──PUT /photos/{key}──▶ API Gateway (S3 proxy) ──▶ S3 photos bucket (B2)
+                                                                         │ PUT event
+                                                                         ▼
+                                                              LF1 index-photos
+                                                     ├─ S3 headObject → x-amz-meta-customLabels
+                                                     ├─ Rekognition detectLabels
+                                                     └─ OpenSearch index "photos"
+ 
+Search:  Browser ──GET /search?q=──▶ API Gateway ──▶ LF2 search-photos
+                                                     ├─ Lex V2 (SearchIntent) → keywords
+                                                     ├─ OpenSearch query on "labels"
+                                                     └─ presigned S3 URLs → {"results": [...]}
+```
+ 
+## Repository layout
+ 
+```
+.
+├── index-photos/
+│   └── lambda_function.py     # LF1 – indexes uploaded photos
+├── search-photos/
+│   └── lambda_function.py     # LF2 – handles search queries
+├── cloudformation/
+│   └── template.yaml          # T1 – CloudFormation stack
+├── buildspec.yml              # CodeBuild spec used by pipeline P1
+└── README.md
+```
+ 
+---
+ 
+## LF1 — `index-photos`
+ 
+Triggered by **S3 `ObjectCreated:Put`** events on the photos bucket.
+ 
+1. Reads the bucket and key from the S3 event (the key is URL-decoded with `unquote_plus`).
+2. Calls `s3.head_object` and reads `Metadata["customlabels"]`
+   (the `x-amz-meta-customLabels` header sent at upload time, e.g. `"Sam, Sally"`),
+   splits it on commas → lowercase list **A1**.
+3. Calls `rekognition.detect_labels` (max 20 labels, min confidence 70) and appends each
+   label name (lowercased, de-duplicated) to A1.
+4. Saves a document to the `photos` index, using the object key as the document ID:
+```json
+{
+  "objectKey": "1795051158909-cat2.jpeg",
+  "bucket": "ai-photo-storage",
+  "createdTimestamp": "2026-11-19T01:19:19",
+  "labels": ["sam", "sally", "cat", "animal", "pet", "mammal"]
+}
+```
+ 
+**Environment variables**
+ 
+| Name | Example |
+|---|---|
+| `ES_HOST` | `search-photos-xxxx.aos.us-east-1.on.aws` (no `https://`) |
+| `ES_INDEX` | `photos` |
+ 
+**IAM permissions:** `s3:GetObject` on the photos bucket, `rekognition:DetectLabels`,
+`es:ESHttpPut/Post/Get` on the domain, plus `AWSLambdaBasicExecutionRole` for logs.
+ 
+## LF2 — `search-photos`
+ 
+Invoked by API Gateway `GET /search?q=...` (Lambda proxy integration).
+ 
+1. Reads `q` from `queryStringParameters`. An empty or missing `q` returns `{"results": []}`.
+2. Sends `q` to the Lex V2 bot with `recognize_text` (a new session ID for each search).
+   If the intent is `SearchIntent`, it collects the `keywordOne` / `keywordTwo` slot values.
+3. **Fallback:** if Lex returns no keywords (e.g. names used as custom labels, such as
+   *"vaishnavi"*), it uses the words of the query minus common filler words.
+4. Runs a `bool` / `should` query with `minimum_should_match: 1`, so a photo matches if **any**
+   keyword matches **any** label. *"cats and dogs"* therefore returns cat photos and dog photos.
+5. Returns the response defined by the API spec, with a presigned S3 URL (valid 1 hour) for each photo:
+```json
+{ "results": [ { "url": "https://...", "labels": ["dog", "animal", "pet"] } ] }
+```
+ 
+Errors return `500` with `{"code": 500, "message": "..."}`. Every response includes CORS headers.
+ 
+**Environment variables**
+ 
+| Name | Example |
+|---|---|
+| `ES_HOST` | `search-photos-xxxx.aos.us-east-1.on.aws` |
+| `ES_INDEX` | `photos` |
+| `BOT_ID` | Lex V2 bot ID |
+| `BOT_ALIAS_ID` | `TSTALIASID` |
+| `LOCALE_ID` | `en_US` |
+ 
+**IAM permissions:** `lex:RecognizeText`, `es:ESHttpPost/Get`, `s3:GetObject` on the photos
+bucket (needed for presigned URLs), plus `AWSLambdaBasicExecutionRole`.
+ 
+### Calling OpenSearch
+ 
+Both Lambdas sign their requests with **SigV4** using `botocore`
+(`SigV4Auth(credentials, "es", region)`) and send them with `urllib.request`,
+so there are **no external dependencies** to package.
+ 
+---
+ 
+## OpenSearch setup
+ 
+- Domain `photos`, with **fine-grained access control** enabled.
+- The domain access policy allows `"AWS": "*"`; access is enforced by fine-grained access control.
+- Both Lambda execution role ARNs are mapped to the `all_access` role
+  (OpenSearch Dashboards → Security → Roles → `all_access` → Mapped users → Backend roles).
+- Index created **before** any photo is indexed, with an English analyzer on `labels`,
+  so that *"dogs"* matches *"dog"*:
+```json
+PUT photos
+{
+  "mappings": {
+    "properties": {
+      "objectKey":        { "type": "keyword" },
+      "bucket":           { "type": "keyword" },
+      "createdTimestamp": { "type": "date", "format": "yyyy-MM-dd'T'HH:mm:ss" },
+      "labels":           { "type": "text", "analyzer": "english" }
+    }
+  }
+}
+```
+ 
+## Lex V2 bot
+ 
+- Intent **`SearchIntent`** with slots `keywordOne` (required) and `keywordTwo` (optional),
+  both of the custom slot type **`PhotoKeyword`**, with slot value resolution set to **Expand values**
+  so the bot accepts words that aren't in its sample values.
+- Sample utterances cover keyword and sentence searches, e.g.
+  `{keywordOne}`, `{keywordOne} and {keywordTwo}`, `show me {keywordOne}`,
+  `show me photos with {keywordOne} and {keywordTwo} in them`.
+## API Gateway
+ 
+| Method | Path | Integration |
+|---|---|---|
+| `PUT` | `/photos/{object}` | AWS service → S3 `PUT` with path override `<photos-bucket>/{object}`. The `Content-Type` and `x-amz-meta-customLabels` headers are mapped as **integration request headers** |
+| `GET` | `/search?q=` | Lambda proxy → LF2 |
+ 
+- Both methods require an **API key**, attached to a usage plan on stage `v1`.
+- Binary media types: `image/jpeg`, `image/png`.
+- CORS is enabled on both resources. The `/photos/{object}` OPTIONS response allows the
+  `x-amz-meta-customLabels` header.
+---
+ 
+## CI/CD — CodePipeline P1
+ 
+Any push to `main` triggers the pipeline:
+ 
+1. **Source:** GitHub (via GitHub App / CodeConnections).
+2. **Build:** CodeBuild runs `buildspec.yml`, which zips each Lambda folder and calls
+   `aws lambda update-function-code` for `index-photos` and `search-funtion`.
+The CodeBuild service role needs `lambda:UpdateFunctionCode` on both functions.
+The pipeline service role needs `codeconnections:UseConnection` on the GitHub connection.
+ 
+---
+ 
+## CloudFormation — T1
+ 
+`cloudformation/template.yaml` creates a complete, separate copy of the stack:
+ 
+- Frontend bucket (public static website) and photos bucket
+- Both Lambdas with their IAM roles (code taken from zip files in S3)
+- S3 `PUT` trigger → index Lambda
+- API Gateway: `PUT /photos/{object}`, `GET /search`, CORS, deployment, stage, API key and usage plan
+- Outputs: **website URL**, API invoke URL, API key ID
+### Deploy
+ 
+```bash
+# 1. Upload the Lambda code
+aws s3 mb s3://<code-bucket>
+(cd index-photos  && zip -r ../index-photos.zip .)
+(cd search-photos && zip -r ../search-photos.zip .)
+aws s3 cp index-photos.zip  s3://<code-bucket>/
+aws s3 cp search-photos.zip s3://<code-bucket>/
+ 
+# 2. Create / update the stack
+aws cloudformation deploy \
+  --template-file cloudformation/template.yaml \
+  --stack-name photo-search-cf \
+  --capabilities CAPABILITY_IAM \
+  --parameter-overrides \
+      FrontendBucketName=<unique-frontend-bucket> \
+      PhotosBucketName=<unique-photos-bucket> \
+      LambdaCodeBucket=<code-bucket> \
+      EsHost=<opensearch-endpoint-without-https> \
+      LexBotId=<bot-id>
+ 
+# 3. See the outputs
+aws cloudformation describe-stacks --stack-name photo-search-cf \
+  --query "Stacks[0].Outputs" --output table
+```
+ 
+**Updating Lambda code through the template:** upload a zip under a new key
+(e.g. `index-photos-v2.zip`) and redeploy with `IndexLambdaKey=index-photos-v2.zip`.
+ 
+The new Lambda roles created by the stack must also be mapped to `all_access` in
+OpenSearch Dashboards before they can read from or write to the index.
+ 
+---
+ 
+## Testing
+ 
+```bash
+API=https://<api-id>.execute-api.us-east-1.amazonaws.com/v1
+KEY=<api-key>
+ 
+# Upload with custom labels
+curl -i -X PUT "$API/photos/test.jpg" \
+  -H "x-api-key: $KEY" -H "Content-Type: image/jpeg" \
+  -H "x-amz-meta-customLabels: sam, sally" \
+  --data-binary @test.jpg
+ 
+# Search
+curl "$API/search?q=show%20me%20dogs" -H "x-api-key: $KEY"
+curl "$API/search?q=sam"              -H "x-api-key: $KEY"
+```
+ 
+Check `/aws/lambda/index-photos` in CloudWatch for `Custom labels: [...]` and `Saved: ... created`.
+ 
+## Troubleshooting
+ 
+| Symptom | Cause / fix |
+|---|---|
+| `403` from OpenSearch in the Lambda logs | The Lambda role isn't mapped to `all_access` in Dashboards |
+| `Metadata: {}` although the browser sent labels | The API Gateway header mapping is missing, or was added as a path parameter instead of an integration request header. Redeploy the API after fixing it |
+| CORS error on upload with labels | `x-amz-meta-customLabels` is missing from Access-Control-Allow-Headers on OPTIONS. Redeploy the API |
+| Search for a name returns nothing | Lex didn't extract it; the LF2 fallback handles this. Adding the name to the `PhotoKeyword` sample values also helps |
+| `"dogs"` doesn't match `"dog"` | The index was auto-created without the English analyzer. Delete it, recreate it with the mapping above, and re-index |
+ 
