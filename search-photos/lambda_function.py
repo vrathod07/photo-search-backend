@@ -107,6 +107,16 @@ def lambda_handler(event, context):
         print("Keywords:", keywords)
 
         # FIX 5: assignment says: no keywords -> empty results (don't search)
+        keywords = get_keywords(query)
+        print("Keywords:", keywords)
+
+        if not keywords:
+            stop_words = {"show", "me", "photos", "photo", "pictures", "picture", "images",
+                          "image", "with", "of", "and", "in", "them", "the", "a", "an",
+                          "find", "search", "for", "all", "some", "please"}
+            keywords = [w for w in query.lower().split() if w not in stop_words]
+            print("Lex found nothing, fallback keywords:", keywords)
+
         if not keywords:
             return respond(200, {"results": []})
 
