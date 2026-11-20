@@ -240,4 +240,7 @@ Check `/aws/lambda/index-photos` in CloudWatch for `Custom labels: [...]` and `S
 | CORS error on upload with labels | `x-amz-meta-customLabels` is missing from Access-Control-Allow-Headers on OPTIONS. Redeploy the API |
 | Search for a name returns nothing | Lex didn't extract it; the LF2 fallback handles this. Adding the name to the `PhotoKeyword` sample values also helps |
 | `"dogs"` doesn't match `"dog"` | The index was auto-created without the English analyzer. Delete it, recreate it with the mapping above, and re-index |
+
+
+#updating readme
  
