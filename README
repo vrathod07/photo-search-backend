@@ -242,5 +242,3 @@ Check `/aws/lambda/index-photos` in CloudWatch for `Custom labels: [...]` and `S
 | `"dogs"` doesn't match `"dog"` | The index was auto-created without the English analyzer. Delete it, recreate it with the mapping above, and re-index |
 
 
-#updating readme
-#upating readme video
